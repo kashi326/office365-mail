@@ -2,47 +2,44 @@
 
 namespace Office365Mail\Transport;
 
-use Illuminate\Mail\Transport\Transport;
-use Swift_Mime_SimpleMessage;
+use Illuminate\Support\Str;
 use Microsoft\Graph\Graph;
 use Microsoft\Graph\Model\UploadSession;
+use Symfony\Component\Mailer\Exception\TransportException;
+use Symfony\Component\Mailer\SentMessage;
+use Symfony\Component\Mailer\Transport\AbstractTransport;
+use Symfony\Component\Mime\Email;
+use Symfony\Component\Mime\MessageConverter;
 
-class Office365MailTransport extends Transport
+class Office365MailTransport extends AbstractTransport
 {
-
-    public function __construct()
+    protected function doSend(SentMessage $message): void
     {
-    }
+        try {
+            $email = MessageConverter::toEmail($message->getOriginalMessage());
 
-    public function send(Swift_Mime_SimpleMessage $message, &$failedRecipients = null)
-    {
+            $graph = new Graph();
 
-        $this->beforeSendPerformed($message);
+            $graph->setAccessToken($this->getAccessToken());
 
-        $graph = new Graph();
+            // Special treatment if the message has too large attachments
+            $messageBody = $this->getBody($email, !!$email->getAttachments());
+            $messageBodySizeMb = strlen(json_encode($messageBody));
+            $messageBodySizeMb /= 1048576; //byte -> mb
 
-        $graph->setAccessToken($this->getAccessToken());
+            if ($messageBodySizeMb >= 4) {
+                unset($messageBody);
+                $graphMessage = $graph->createRequest("POST", "/users/" . $email->getFrom()[0]->getAddress() . "/messages")
+                    ->attachBody($this->getBody($email)["message"])
+                    ->setReturnType(\Microsoft\Graph\Model\Message::class)
+                    ->execute();
 
-        // Special treatment if the message has too large attachments
-        $messageBody = $this->getBody($message, true);
-        $messageBodySizeMb = json_encode($messageBody);
-        $messageBodySizeMb = strlen($messageBodySizeMb);
-        $messageBodySizeMb = $messageBodySizeMb / 1048576; //byte -> mb
-
-        if ($messageBodySizeMb >= 4) {
-            unset($messageBody);
-            $graphMessage = $graph->createRequest("POST", "/users/" . key($message->getFrom()) . "/messages")
-                ->attachBody($this->getBody($message))
-                ->setReturnType(\Microsoft\Graph\Model\Message::class)
-                ->execute();
-
-            foreach ($message->getChildren() as $attachment) {
-                if ($attachment instanceof \Swift_Mime_SimpleMimeEntity) {
-                    $fileName = $attachment->getHeaders()->get('Content-Disposition')->getParameter('filename');
+                foreach ($email->getAttachments() as $attachment) {
+                    $fileName = $attachment->getPreparedHeaders()->getHeaderParameter('Content-Disposition', 'filename');
                     $content = $attachment->getBody();
                     $fileSize = strlen($content);
                     $size = $fileSize / 1048576; //byte -> mb
-                    $id = $attachment->getId();
+                    $id = Str::random(10);
                     $attachmentMessage = [
                         'AttachmentItem' => [
                             'attachmentType' => 'file',
@@ -54,19 +51,19 @@ class Office365MailTransport extends Transport
                     if ($size <= 3) { //ErrorAttachmentSizeShouldNotBeLessThanMinimumSize if attachment <= 3mb, then we need to add this
                         $attachmentBody = [
                             "@odata.type" => "#microsoft.graph.fileAttachment",
-                            "name" => $attachment->getHeaders()->get('Content-Disposition')->getParameter('filename'),
-                            "contentType" => $attachment->getBodyContentType(),
+                            "name" => $attachment->getPreparedHeaders()->getHeaderParameter('Content-Disposition', 'filename'),
+                            "contentType" => $attachment->getPreparedHeaders()->get('Content-Type')->getValue(),
                             "contentBytes" => base64_encode($attachment->getBody()),
                             'contentId'    => $id
                         ];
 
-                        $addAttachment = $graph->createRequest("POST", "/users/" . key($message->getFrom()) . "/messages/" . $graphMessage->getId() . "/attachments")
+                        $addAttachment = $graph->createRequest("POST", "/users/" . $email->getFrom()[0]->getAddress() . "/messages/" . $graphMessage->getId() . "/attachments")
                             ->attachBody($attachmentBody)
                             ->setReturnType(UploadSession::class)
                             ->execute();
                     } else {
                         //upload the files in chunks of 4mb....
-                        $uploadSession = $graph->createRequest("POST", "/users/" . key($message->getFrom()) . "/messages/" . $graphMessage->getId() . "/attachments/createUploadSession")
+                        $uploadSession = $graph->createRequest("POST", "/users/" . $email->getFrom()[0]->getAddress() . "/messages/" . $graphMessage->getId() . "/attachments/createUploadSession")
                             ->attachBody($attachmentMessage)
                             ->setReturnType(UploadSession::class)
                             ->execute();
@@ -105,38 +102,32 @@ class Office365MailTransport extends Transport
                         }
                     }
                 }
+
+                //definetly send the message
+                $graph->createRequest("POST", "/users/" . $email->getFrom()[0]->getAddress() . "/messages/" . $graphMessage->getId() . "/send")->execute();
+            } else {
+                $graphMessage = $graph->createRequest("POST", "/users/" . $email->getFrom()[0]->getAddress() . "/sendmail")
+                    ->attachBody($messageBody)
+                    ->setReturnType(\Microsoft\Graph\Model\Message::class)
+                    ->execute();
             }
-
-            //definetly send the message
-            $graph->createRequest("POST", "/users/" . key($message->getFrom()) . "/messages/" . $graphMessage->getId() . "/send")->execute();
-        } else {
-            $graphMessage = $graph->createRequest("POST", "/users/" . key($message->getFrom()) . "/sendmail")
-                ->attachBody($messageBody)
-                ->setReturnType(\Microsoft\Graph\Model\Message::class)
-                ->execute();
+        } catch (\Exception $exception) {
+            throw new TransportException($exception->getMessage(), $exception->getCode(), $exception);
         }
-
-        $this->sendPerformed($message);
-
-        return $this->numberOfRecipients($message);
     }
 
     /**
      * Get body for the message.
      *
-     * @param \Swift_Mime_SimpleMessage $message
+     * @param Symfony\Component\Mime\Email $message
      * @param bool $withAttachments
      * @return array
      */
-
-    protected function getBody(Swift_Mime_SimpleMessage $message, $withAttachments = false)
+    protected function getBody(Email $message, $withAttachments = false)
     {
         $messageData = [
             'from' => [
-                'emailAddress' => [
-                    'address' => key($message->getFrom()),
-                    'name' => current($message->getFrom())
-                ]
+                'emailAddress' => $message->getFrom()[0]
             ],
             'toRecipients' => $this->getTo($message),
             'ccRecipients' => $this->getCc($message),
@@ -144,25 +135,24 @@ class Office365MailTransport extends Transport
             'replyTo' => $this->getReplyTo($message),
             'subject' => $message->getSubject(),
             'body' => [
-                'contentType' => $message->getBodyContentType() == "text/html" ? 'html' : 'text',
-                'content' => $message->getBody()
+                'contentType' => $message->getHtmlBody() ? 'html' : 'text',
+                'content' => $message->getHtmlBody() ? $message->getHtmlBody() : $message->getTextBody()
             ]
         ];
+        $messageData = ['message' => $messageData];
 
         if ($withAttachments) {
-            $messageData = ['message' => $messageData];
             //add attachments if any
             $attachments = [];
-            foreach ($message->getChildren() as $attachment) {
-                if ($attachment instanceof \Swift_Mime_SimpleMimeEntity) {
-                    $attachments[] = [
-                        "@odata.type" => "#microsoft.graph.fileAttachment",
-                        "name" => $attachment->getHeaders()->get('Content-Disposition')->getParameter('filename'),
-                        "contentType" => $attachment->getBodyContentType(),
-                        "contentBytes" => base64_encode($attachment->getBody()),
-                        'contentId'    => $attachment->getId()
-                    ];
-                }
+            foreach ($message->getAttachments() as $attachment) {
+                $headers = $attachment->getPreparedHeaders();
+                $attachments[] = [
+                    "@odata.type" => "#microsoft.graph.fileAttachment",
+                    "name" => $headers->getHeaderParameter('Content-Disposition', 'filename'),
+                    "contentType" => $headers->get('Content-Type')->getValue(),
+                    "contentBytes" => base64_encode($attachment->getBody()),
+                    'contentId'    => Str::random(10)
+                ];
             }
             if (count($attachments) > 0) {
                 $messageData['message']['attachments'] = $attachments;
@@ -175,20 +165,20 @@ class Office365MailTransport extends Transport
     /**
      * Get the "to" payload field for the API request.
      *
-     * @param \Swift_Mime_SimpleMessage $message
+     * @param Symfony\Component\Mime\Email $message
      * @return string
      */
-    protected function getTo(Swift_Mime_SimpleMessage $message)
+    protected function getTo(Email $message)
     {
-        return collect((array) $message->getTo())->map(function ($display, $address) {
-            return $display ? [
+        return collect((array) $message->getTo())->map(function ($address) {
+            return $address->getName() ? [
                 'emailAddress' => [
-                    'address' => $address,
-                    'name' => $display
+                    'address' => $address->getAddress(),
+                    'name' => $address->getName()
                 ]
             ] : [
                 'emailAddress' => [
-                    'address' => $address
+                    'address' => $address->getAddress()
                 ]
             ];
         })->values()->toArray();
@@ -197,20 +187,20 @@ class Office365MailTransport extends Transport
     /**
      * Get the "Cc" payload field for the API request.
      *
-     * @param \Swift_Mime_SimpleMessage $message
+     * @param Symfony\Component\Mime\Email $message
      * @return string
      */
-    protected function getCc(Swift_Mime_SimpleMessage $message)
+    protected function getCc(Email $message)
     {
-        return collect((array) $message->getCc())->map(function ($display, $address) {
-            return $display ? [
+        return collect((array) $message->getCc())->map(function ($address) {
+            return $address->getName() ? [
                 'emailAddress' => [
-                    'address' => $address,
-                    'name' => $display
+                    'address' => $address->getAddress(),
+                    'name' => $address->getName()
                 ]
             ] : [
                 'emailAddress' => [
-                    'address' => $address
+                    'address' => $address->getAddress()
                 ]
             ];
         })->values()->toArray();
@@ -219,20 +209,20 @@ class Office365MailTransport extends Transport
     /**
      * Get the "replyTo" payload field for the API request.
      *
-     * @param \Swift_Mime_SimpleMessage $message
+     * @param Symfony\Component\Mime\Email $message
      * @return string
      */
-    protected function getReplyTo(Swift_Mime_SimpleMessage $message)
+    protected function getReplyTo(Email $message)
     {
-        return collect((array) $message->getReplyTo())->map(function ($display, $address) {
-            return $display ? [
+        return collect((array) $message->getReplyTo())->map(function ($address) {
+            return $address->getName() ? [
                 'emailAddress' => [
-                    'address' => $address,
-                    'name' => $display
+                    'address' => $address->getAddress(),
+                    'name' => $address->getName()
                 ]
             ] : [
                 'emailAddress' => [
-                    'address' => $address
+                    'address' => $address->getAddress()
                 ]
             ];
         })->values()->toArray();
@@ -241,20 +231,20 @@ class Office365MailTransport extends Transport
     /**
      * Get the "Bcc" payload field for the API request.
      *
-     * @param \Swift_Mime_SimpleMessage $message
+     * @param Symfony\Component\Mime\Email $message
      * @return string
      */
-    protected function getBcc(Swift_Mime_SimpleMessage $message)
+    protected function getBcc(Email $message)
     {
-        return collect((array) $message->getBcc())->map(function ($display, $address) {
-            return $display ? [
+        return collect((array) $message->getBcc())->map(function ($address) {
+            return $address->getName() ? [
                 'emailAddress' => [
-                    'address' => $address,
-                    'name' => $display
+                    'address' => $address->getAddress(),
+                    'name' => $address->getName()
                 ]
             ] : [
                 'emailAddress' => [
-                    'address' => $address
+                    'address' => $address->getAddress()
                 ]
             ];
         })->values()->toArray();
@@ -263,10 +253,10 @@ class Office365MailTransport extends Transport
     /**
      * Get all of the contacts for the message.
      *
-     * @param \Swift_Mime_SimpleMessage $message
+     * @param Symfony\Component\Mime\Email $message
      * @return array
      */
-    protected function allContacts(Swift_Mime_SimpleMessage $message)
+    protected function allContacts(Email $message)
     {
         return array_merge(
             (array) $message->getTo(),
@@ -290,5 +280,15 @@ class Office365MailTransport extends Transport
         ])->getBody()->getContents());
 
         return $token->access_token;
+    }
+
+    /**
+     * Get the string representation of the transport.
+     *
+     * @return string
+     */
+    public function __toString(): string
+    {
+        return 'office365mail';
     }
 }
